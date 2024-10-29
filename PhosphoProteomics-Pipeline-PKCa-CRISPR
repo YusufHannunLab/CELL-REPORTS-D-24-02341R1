@@ -1,0 +1,374 @@
+###Phosphoproteomics Analysis Pipeline for PKCa CRISPR (CELL-REPORTS-D-24-02341R1)
+
+#BiocManager::install("reactome.db", force=TRUE)
+#BiocManager::install("ReactomeContentService4R", force=TRUE)
+library(tidyr)
+library(plyr)
+library(dplyr)
+library(stringi)
+library(stringr)
+library(qdapRegex)
+library(readxl)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(PhosR)
+library(limma)
+library(calibrate)
+library(directPA)
+library(reactome.db)
+library(ReactomeContentService4R)
+library(annotate)
+library(ggplot2)
+library(rgl)
+library(circlize)
+library(collapse)
+library(resample)
+library(mixOmics)
+library(matrixStats)
+library(mratios)
+library(Barnard)
+library(Exact)
+data("KinaseMotifs")
+data("KinaseFamily")
+data("PhosphoSitePlus")
+
+set.seed(100)
+
+##Preprocess phosphosites from Proteome Discoverer and normalize by total peptide abundance
+   
+#Get phosphosites and abundances
+
+PRKCA_CRISPR_Peptides <- read_xlsx("../../PRKCA\ CR\ TiO2\ Peptides.xlsx")
+PRKCA_CRISPR_Peptides_data <- paste(PRKCA_CRISPR_Peptides$`Modifications in Master Proteins`, PRKCA_CRISPR_Peptides$`Abundances (Grouped): Light, PKC-1`, PRKCA_CRISPR_Peptides$`Abundances (Grouped): Light, PKC-2`, PRKCA_CRISPR_Peptides$`Abundances (Grouped): Light, PKC-3`, PRKCA_CRISPR_Peptides$`Abundances (Grouped): Heavy, PKC-1`, PRKCA_CRISPR_Peptides$`Abundances (Grouped): Heavy, PKC-2`, PRKCA_CRISPR_Peptides$`Abundances (Grouped): Heavy, PKC-3`)
+for (PHOSPHO in PRKCA_CRISPR_Peptides_data[grep("Phospho", PRKCA_CRISPR_Peptides_data)]) {
+    for (SITES in strsplit(unlist(qdapRegex::ex_between(PHOSPHO, "Phospho [", "]")), split="; "))
+        for (SITE in SITES)
+            assign(paste0(gsub(" ", "", PHOSPHO), paste0(as.data.frame(SITES)), SITE, "_data_strings"), paste(sub(" .*", "", PHOSPHO), SITE, unlist(strsplit(PHOSPHO, " "))[length(unlist(strsplit(PHOSPHO, " ")))-5], unlist(strsplit(PHOSPHO, " "))[length(unlist(strsplit(PHOSPHO, " ")))-4], unlist(strsplit(PHOSPHO, " "))[length(unlist(strsplit(PHOSPHO, " ")))-3], unlist(strsplit(PHOSPHO, " "))[length(unlist(strsplit(PHOSPHO, " ")))-2], unlist(strsplit(PHOSPHO, " "))[length(unlist(strsplit(PHOSPHO, " ")))-1], unlist(strsplit(PHOSPHO, " "))[length(unlist(strsplit(PHOSPHO, " ")))]))
+}
+PRKCA_CRISPR_Phosphosite_List <- as.data.frame(do.call(unlist, list(lapply(ls()[grep("_data_strings$", ls())], get))))
+PRKCA_CRISPR_Phosphosite_df <- separate(PRKCA_CRISPR_Phosphosite_List, col=1, into=c("Protein_Accession","Site","Light_PKC1","Light_PKC2","Light_PKC3","Heavy_PKC1","Heavy_PKC2","Heavy_PKC3"), sep=" ")
+
+#Process sites into two columns and replace Uniprot accessions with gene symbols
+
+PRKCA_CRISPR_Phosphosite_filtered_df <- PRKCA_CRISPR_Phosphosite_df[grepl("[A-Z][0-9]+", PRKCA_CRISPR_Phosphosite_df$Site),]
+PRKCA_CRISPR_Phosphosite_filtered_df$Residue <- sub("[0-9]+$", "", PRKCA_CRISPR_Phosphosite_filtered_df$Site)
+PRKCA_CRISPR_Phosphosite_filtered_df$Position <- sub("^[A-Z]+", "", PRKCA_CRISPR_Phosphosite_filtered_df$Site)
+PRKCA_CRISPR_Phosphosite_filtered_df <- PRKCA_CRISPR_Phosphosite_filtered_df[,c(1,9,10,3:8)]
+write.table(PRKCA_CRISPR_Phosphosite_filtered_df, file="PRKCA_CRISPR_Phosphosite_Filtered_df.txt")
+PRKCA_CRISPR_Phosphosite_backup <- PRKCA_CRISPR_Phosphosite_filtered_df
+
+
+#Get window of sequence around phosphosites and convert UniProt accessions to gene symbols
+
+uniprot_db <- read.table("~/uniprotkb_organism_name_Human_AND_model_2023_07_31.txt", sep="\t", header=TRUE)
+uniprot_db$Sequence_buffer <- paste0("-------------------------------", uniprot_db$Sequence, "-------------------------------")
+PRKCA_CRISPR_Phosphosite_filtered_df_trimmed <- PRKCA_CRISPR_Phosphosite_filtered_df[sub("-.*", "", PRKCA_CRISPR_Phosphosite_filtered_df$Protein_Accession) %in% "Q9NSE7" == FALSE,]
+PRKCA_CRISPR_Phosphosite_filtered_df_trimmed <- PRKCA_CRISPR_Phosphosite_filtered_df_trimmed[sub("-.*", "", PRKCA_CRISPR_Phosphosite_filtered_df_trimmed$Protein_Accession) %in% "Q9P0W5" == FALSE,]
+for (i in 1:length(PRKCA_CRISPR_Phosphosite_filtered_df_trimmed[,1])) {
+   PRKCA_CRISPR_Phosphosite_filtered_df_trimmed$Window[i] <- substr(uniprot_db$Sequence_buffer[grepl(sub("-.*", "", PRKCA_CRISPR_Phosphosite_filtered_df_trimmed$Protein_Accession[i]), uniprot_db$Entry)], start=as.numeric(PRKCA_CRISPR_Phosphosite_filtered_df_trimmed$Position[i])+1, stop=as.numeric(PRKCA_CRISPR_Phosphosite_filtered_df_trimmed$Position[i])+61)
+}
+PRKCA_CRISPR_Phosphosite_filtered_df_trimmed <- PRKCA_CRISPR_Phosphosite_filtered_df_trimmed[,c(1,2,3,10,4:9)]
+write.table(PRKCA_CRISPR_Phosphosite_filtered_df_trimmed, file="PRKCA_CRISPR_Phosphosite_Filtered_df_trimmed.txt")
+PRKCA_CRISPR_Phosphosite_backup <- PRKCA_CRISPR_Phosphosite_filtered_df_trimmed
+PRKCA_CRISPR_Phosphosite_filtered_df_trimmed[,1] <- AnnotationDbi::mapIds(org.Hs.eg.db, keys=gsub("-.*", "", PRKCA_CRISPR_Phosphosite_filtered_df_trimmed$Protein_Accession), keytype="UNIPROT", column="SYMBOL")
+PRKCA_CRISPR_Phosphosite_filtered_df_trimmed <- PRKCA_CRISPR_Phosphosite_filtered_df_trimmed[is.na(PRKCA_CRISPR_Phosphosite_filtered_df_trimmed[,1]) == FALSE,]
+
+#Clean up data
+
+colnames(PRKCA_CRISPR_Phosphosite_filtered_df_trimmed)[1:4] <- c("GeneSymbol", "Residue", "Site", "Sequence")
+PRKCA_CRISPR_Phosphosite_filtered_df_trimmed[,5:10] <- replace(PRKCA_CRISPR_Phosphosite_filtered_df_trimmed[,5:10], PRKCA_CRISPR_Phosphosite_filtered_df_trimmed[,5:10]=="NA", 0)
+PRKCA_CRISPR_Phosphosite_filtered_df_trimmed[,5:10] <- sapply(PRKCA_CRISPR_Phosphosite_filtered_df_trimmed[,5:10], as.numeric)
+
+##Collapse data, create PhosphoExperiment object and other objects for downstream analysis
+
+PRKCA_CRISPR_PhosR_mat <- PRKCA_CRISPR_Phosphosite_filtered_df_trimmed
+PRKCA_CRISPR_PhosR_mat$PhosphositeInfo <- paste0(PRKCA_CRISPR_PhosR_mat[,1], ";", PRKCA_CRISPR_PhosR_mat[,2], PRKCA_CRISPR_PhosR_mat[,3], ";", PRKCA_CRISPR_PhosR_mat[,4])
+PRKCA_CRISPR_PhosR_mat[,5:10] <- replace(PRKCA_CRISPR_PhosR_mat[,5:10], PRKCA_CRISPR_PhosR_mat[,5:10]==0, NA)
+PRKCA_CRISPR_PhosR_mat[,5:10] <- matrix(sapply(PRKCA_CRISPR_PhosR_mat[,5:10], as.numeric), ncol=6, byrow=FALSE)
+PRKCA_CRISPR_PhosR_mat <- collapse::collap(PRKCA_CRISPR_PhosR_mat, by = ~PhosphositeInfo, FUN=fsum)
+PRKCA_CRISPR_PhosR_mat[,5:10] <- matrix(sapply(PRKCA_CRISPR_PhosR_mat[,5:10], as.numeric), ncol=6, byrow=FALSE)
+
+rownames(PRKCA_CRISPR_PhosR_mat) <- paste0(gsub(";.+", "", PRKCA_CRISPR_PhosR_mat$PhosphositeInfo), ";", qdapRegex::ex_between(PRKCA_CRISPR_PhosR_mat$PhosphositeInfo, ";", ";"), ";")
+PRKCA_CRISPR_PhosR <- PhosphoExperiment(assays = list(Quantification = PRKCA_CRISPR_PhosR_mat[,5:10]))
+PRKCA_CRISPR_PhosR@GeneSymbol <- gsub(";.+", "", PRKCA_CRISPR_PhosR_mat$PhosphositeInfo)
+PRKCA_CRISPR_PhosR@Sequence <- gsub(".+;", "", PRKCA_CRISPR_PhosR_mat$PhosphositeInfo)
+PRKCA_CRISPR_PhosR_Phosphosites <- qdapRegex::ex_between(PRKCA_CRISPR_PhosR_mat$PhosphositeInfo, ";", ";")
+PRKCA_CRISPR_PhosR@Site <- as.numeric(gsub("^[A-Z]+", "", PRKCA_CRISPR_PhosR_Phosphosites))
+PRKCA_CRISPR_PhosR@Residue <- gsub("[0-9]+$", "", PRKCA_CRISPR_PhosR_Phosphosites)
+PRKCA_CRISPR_PhosR_colData <- S4Vectors::DataFrame(cellline=rep("LungCancer", 6), condition=c(rep("Light", 3), rep("Heavy", 3)), replicate=rep(c(1,2,3), 2))
+rownames(PRKCA_CRISPR_PhosR_colData) <- colnames(PRKCA_CRISPR_Phosphosite_filtered_df_trimmed)[5:10]
+SummarizedExperiment::colData(PRKCA_CRISPR_PhosR) <- PRKCA_CRISPR_PhosR_colData
+PRKCA_CRISPR_PhosR_logmat <- log2(PRKCA_CRISPR_PhosR_mat[,5:10])
+colnames(PRKCA_CRISPR_PhosR_logmat) <- colnames(PRKCA_CRISPR_PhosR)
+rownames(PRKCA_CRISPR_PhosR_logmat) <- rownames(PRKCA_CRISPR_PhosR)
+SummarizedExperiment::assay(PRKCA_CRISPR_PhosR, "Quantification") <- PRKCA_CRISPR_PhosR_logmat
+PRKCA_CRISPR_grps <- paste0(SummarizedExperiment::colData(PRKCA_CRISPR_PhosR)$cellline, "_", SummarizedExperiment::colData(PRKCA_CRISPR_PhosR)$condition)
+sites <- paste(
+   sapply(PRKCA_CRISPR_PhosR@GeneSymbol, function(x)x),
+   ";",
+   sapply(PRKCA_CRISPR_PhosR@Residue, function(x)x),
+   sapply(PRKCA_CRISPR_PhosR@Site, function(x)x),
+   ";",     
+   sep = "")
+
+##Analyze data
+
+      PRKCA_CRISPR_PhosR <- PRKCA_CRISPR_PhosR[,c(1:3,4:6)]
+      PRKCA_CRISPR_PhosR_design <- matrix(nrow=6, ncol=2)
+      PRKCA_CRISPR_PhosR_design[,1] <- c(1,1,1,0,0,0)
+      PRKCA_CRISPR_PhosR_design[,2] <- c(0,0,0,1,1,1)
+      colnames(PRKCA_CRISPR_PhosR_design) <- c("Light","Heavy")
+      PRKCA_CRISPR_PhosR <- ptImpute(mat1=PRKCA_CRISPR_PhosR[,1:3], mat2=PRKCA_CRISPR_PhosR[,4:6], percent1=0.99, percent2=0.01, assay = "Quantification", paired=TRUE)
+      PRKCA_CRISPR_PhosR <- medianScaling(PRKCA_CRISPR_PhosR, scale = TRUE, assay = "Quantification")
+      fit <- lmFit(PRKCA_CRISPR_PhosR@assays@data$scaled, PRKCA_CRISPR_PhosR_design)
+      contrast.matrix <- makeContrasts(Heavy-Light, levels=PRKCA_CRISPR_PhosR_design)
+      fit2 <- contrasts.fit(fit, contrast.matrix)
+      fit2 <- eBayes(fit2)
+      assign("PRKCA_CRISPR_PhosR_Analysis", as.data.frame(topTable(fit2, number = Inf)))
+
+
+#Visualize results
+
+write.table(PRKCA_CRISPR_PhosR_Analysis, file="PRKCA_CRISPR_PhosR_Analysis.txt")
+png(file = "PRKCA_CRISPR_Volcano_plot.png", bg = "transparent")
+plot(PRKCA_CRISPR_PhosR_Analysis[,1], -log10(PRKCA_CRISPR_PhosR_Analysis[,5]), main="Heavy_vs_Light", xlab="Log2 FC", ylab="-Log10(Adjust P)")
+sel <- which(PRKCA_CRISPR_PhosR_Analysis[,5] < 0.05 & PRKCA_CRISPR_PhosR_Analysis[,1] > 1)
+points(PRKCA_CRISPR_PhosR_Analysis[sel,1], -log10(PRKCA_CRISPR_PhosR_Analysis[sel,5]), pch=16, col="red")
+sel <- which(PRKCA_CRISPR_PhosR_Analysis[,5] < 0.05 & PRKCA_CRISPR_PhosR_Analysis[,1] < -1)
+points(PRKCA_CRISPR_PhosR_Analysis[sel,1], -log10(PRKCA_CRISPR_PhosR_Analysis[sel,5]), pch=16, col="blue")
+length(which(PRKCA_CRISPR_PhosR_Analysis[,5] < 0.05 & PRKCA_CRISPR_PhosR_Analysis[,1] > 1))
+length(which(PRKCA_CRISPR_PhosR_Analysis[,5] < 0.05 & PRKCA_CRISPR_PhosR_Analysis[,1] < -1))
+dev.off()
+
+
+#Plot PCA using mixOmics
+
+PRKCA_CRISPR_PhosR_PCA_input <- t(cbind(PRKCA_CRISPR_PhosR@assays@data$Quantification))
+PRKCA_CRISPR_PhosR_PCA_input <- PRKCA_CRISPR_PhosR_PCA_input[,colSums(is.na(PRKCA_CRISPR_PhosR_PCA_input)) < 5]
+PRKCA_CRISPR_PhosR_PCA_input <- PRKCA_CRISPR_PhosR_PCA_input[,resample::colVars(PRKCA_CRISPR_PhosR_PCA_input, na.rm=TRUE) != 0]
+PCA_PRKCA_CRISPR_PhosR <- mixOmics::pca(PRKCA_CRISPR_PhosR_PCA_input, center=TRUE, scale=TRUE, ncomp = 3)
+scores_PCA_PRKCA_CRISPR_PhosR <- as.data.frame(PCA_PRKCA_CRISPR_PhosR$x)
+
+plot3d(scores_PCA_PRKCA_CRISPR_PhosR[,1:3], 
+                                          col = c(rep("forestgreen", 3), rep("lightblue", 3)), size=10)
+
+png(file = "PRKCA_CRISPR_PhosR_PCA_plot_PC1_PC2.png", bg = "transparent")
+scores_PCA_PRKCA_CRISPR_PhosR_plot <- plot(scores_PCA_PRKCA_CRISPR_PhosR[,c(1,2)], 
+                                          col = c(rep("forestgreen", 3), rep("lightblue", 3)), pch=20, cex=3)
+                                          legend(x=1, y=1, legend=c("Empty Vector", "PRKCA CRISPR"), fill=c("forestgreen","lightblue"))
+dev.off()
+png(file = "PRKCA_CRISPR_PhosR_PCA_plot_PC1_PC3.png", bg = "transparent")
+scores_PCA_PRKCA_CRISPR_PhosR_plot <- plot(scores_PCA_PRKCA_CRISPR_PhosR[,c(1,3)], 
+                                          col = c(rep("forestgreen", 3), rep("lightblue", 3)), pch=20, cex=3)
+dev.off()
+png(file = "PRKCA_CRISPR_PhosR_PCA_plot_PC2_PC3.png", bg = "transparent")
+scores_PCA_PRKCA_CRISPR_PhosR_plot <- plot(scores_PCA_PRKCA_CRISPR_PhosR[,c(2,3)], 
+                                          col = c(rep("forestgreen", 3), rep("lightblue", 3)), pch=20, cex=3)
+dev.off()
+scores_PCA_PRKCA_CRISPR_PhosR_plot <- plot(scores_PCA_PRKCA_CRISPR_PhosR[,c(1,2)], 
+                                          col = c(rep("forestgreen", 3), rep("lightblue", 3)), pch=20, cex=3)
+plot.new()
+                                          legend(x=1, y=1, legend=c("Empty Vector", "PRKCA CRISPR"), fill=c("forestgreen","lightblue"))
+
+
+
+#Fisher table for each condition
+#
+#          in path  not in path
+# _________|________|________|_________
+#          |        |        |
+# dependent|    A   |   C    |    P
+# _________|________|________|_________
+#    not   |        |        |
+# dependent|    B   |   D    |    Q   
+# _________|________|________|_________
+#          |        |        |         
+#          |    R   |   S    |    Total    
+#          |        |        | 
+#
+
+
+PRKCA_CRISPR_PhosR_Analysis <- na.omit(PRKCA_CRISPR_PhosR_Analysis)
+reactome_pathways <- toTable(reactome.db::reactomePATHNAME2ID)
+reactome_pathways_Hs <- reactome_pathways[grep("Homo sapiens\\:", reactome_pathways$path_name),]
+for (PATHWAY in reactome_pathways_Hs$DB_ID[reactome_pathways_Hs$DB_ID != "R-HSA-71406" & reactome_pathways_Hs$DB_ID != "R-HSA-163200" & reactome_pathways_Hs$DB_ID != "R-HSA-167827"]) {
+   differential_phosphosites <- rownames(PRKCA_CRISPR_PhosR_Analysis)[PRKCA_CRISPR_PhosR_Analysis[,5] < 0.25 & abs(PRKCA_CRISPR_PhosR_Analysis[,1]) > 1]
+   Total_for_a <- length(unique(gsub(";.*","",rownames(PRKCA_CRISPR_PhosR_Analysis))))
+   A_for_a <- sum(event2Ids(event.id=PATHWAY)$geneSymbol %in% unique(gsub(";.*","",differential_phosphosites)))
+   R_for_a <- sum(event2Ids(event.id=PATHWAY)$geneSymbol %in% unique(gsub(";.*","",rownames(PRKCA_CRISPR_PhosR_Analysis))))
+   P_for_a <- length(unique(gsub(";.*","",differential_phosphosites)))
+   S_for_a <- Total_for_a - R_for_a
+   Q_for_a <- Total_for_a - P_for_a
+   B_for_a <- R_for_a - A_for_a
+   C_for_a <- P_for_a - A_for_a
+   D_for_a <- S_for_a - C_for_a
+   Fisher_matrix <- matrix(c(A_for_a, B_for_a, C_for_a, D_for_a), nrow=2, byrow=FALSE)
+    fisher_test_output <- fisher.test(Fisher_matrix, alternative="greater")
+    write.table(cbind(PATHWAY, fisher_test_output$p.value), file="Fisher_tests_Reactome_PRKCA_CRISPR_onesided_greater_adjusted_pvalue_25.txt", append=TRUE, col.names=FALSE)
+}
+Fisher_tests_Reactome_PKC <- read.table("Fisher_tests_Reactome_PRKCA_CRISPR_onesided_greater_adjusted_pvalue_25.txt", fill=TRUE)
+p.adjust(Fisher_tests_Reactome_PKC$V3[order(Fisher_tests_Reactome_PKC$V3)], method="BH")
+reactome_Ids_with_names <- as.data.frame(reactome.db::reactomePATHID2NAME)
+Fisher_tests_Reactome_PKC_ordered <- Fisher_tests_Reactome_PKC[order(Fisher_tests_Reactome_PKC$V3),]
+for (FISHER_PLUS_PATHWAY in Fisher_tests_Reactome_PKC_ordered[Fisher_tests_Reactome_PKC_ordered$V3 < 0.05, 2]) {
+    write.table(paste0(reactome_Ids_with_names[grep(FISHER_PLUS_PATHWAY, reactome_Ids_with_names$DB_ID),], "$", Fisher_tests_Reactome_PKC_ordered[Fisher_tests_Reactome_PKC_ordered$V2 == FISHER_PLUS_PATHWAY, 3]), file="PKCa_dependent_biologies_Fisher_onesided_greater_adjusted_pvalue_25.txt", append=TRUE, col.names=FALSE)
+}
+for (FISHER_PLUS_PATHWAY in Fisher_tests_Reactome_PKC_ordered[Fisher_tests_Reactome_PKC_ordered$V3 < 0.05, 2]) {
+   print(reactome_Ids_with_names[grep(FISHER_PLUS_PATHWAY, reactome_Ids_with_names$DB_ID),])
+   print(unique(gsub(";.*","",differential_phosphosites))[unique(gsub(";.*","",differential_phosphosites)) %in% event2Ids(event.id=FISHER_PLUS_PATHWAY)$geneSymbol])
+   print(PRKCA_CRISPR_PhosR_Analysis[gsub(";.*","",rownames(PRKCA_CRISPR_PhosR_Analysis)) %in% unique(gsub(";.*","",differential_phosphosites))[unique(gsub(";.*","",differential_phosphosites)) %in% event2Ids(event.id=FISHER_PLUS_PATHWAY)$geneSymbol],1:(ncol(PRKCA_CRISPR_PhosR_Analysis)-1)])
+}
+
+
+
+##Construct "signalomes"
+
+set.seed(100)
+
+PRKCA_CRISPR_PhosR.seq <- na.omit(cbind(PRKCA_CRISPR_PhosR@assays@data$scaled, PRKCA_CRISPR_PhosR@Sequence))[,7]
+PRKCA_CRISPR_PhosR.matrices <- kinaseSubstrateScore(substrate.list = PhosphoSite.human, 
+                                                    mat = na.omit(PRKCA_CRISPR_PhosR@assays@data$scaled), seqs = PRKCA_CRISPR_PhosR.seq, 
+                                                    species="human", numMotif = 20, numSub = 12, verbose = TRUE)
+PRKCA_CRISPR_PhosR.predMat <- kinaseSubstratePred(PRKCA_CRISPR_PhosR.matrices, top=30, verbose = TRUE)
+
+PRKCA_CRISPR_PhosR_Signalome <- Signalomes(KSR=PRKCA_CRISPR_PhosR.matrices, verbose=TRUE, 
+                                           predMatrix=PRKCA_CRISPR_PhosR.predMat, filter=FALSE, threskinaseNetwork = 0.9, signalomeCutoff=0.9,
+                                           exprsMat=na.omit(PRKCA_CRISPR_PhosR@assays@data$scaled), KOI=NULL, module_res=10)
+
+PRKCA_CRISPR_PhosR_Signalome <- Signalomes(KSR=PRKCA_CRISPR_PhosR.matrices, verbose=TRUE, 
+                                           predMatrix=PRKCA_CRISPR_PhosR.predMat, filter=FALSE, threskinaseNetwork = 0.9, signalomeCutoff=0.9,
+                                           exprsMat=na.omit(PRKCA_CRISPR_PhosR@assays@data$scaled), KOI=names(PRKCA_CRISPR_PhosR_Signalome$kinaseSubstrates), module_res=6)
+
+
+#Visualize Signalome and Signalome map
+
+my_color_palette <- grDevices::colorRampPalette(RColorBrewer::brewer.pal(8, "Accent"))
+kinase_all_color <- my_color_palette(ncol(PRKCA_CRISPR_PhosR.matrices$combinedScoreMatrix))
+names(kinase_all_color) <- colnames(PRKCA_CRISPR_PhosR.matrices$combinedScoreMatrix)
+kinase_signalome_color <- kinase_all_color[colnames(PRKCA_CRISPR_PhosR.predMat)]
+plotSignalomeMap(signalomes = PRKCA_CRISPR_PhosR_Signalome, color = kinase_signalome_color)
+
+rm(list=ls(pattern="_Signalome_.*_x"))
+PRKCA_CRISPR_PhosR_Signalome_Signalomes_df <- unlist(PRKCA_CRISPR_PhosR_Signalome$Signalomes, recursive=FALSE)
+for (i in 1:length(names(PRKCA_CRISPR_PhosR_Signalome$Signalomes))) {
+assign(paste0("PRKCA_CRISPR_PhosR_Signalome_", names(PRKCA_CRISPR_PhosR_Signalome$Signalomes)[i], "_x"), as.data.frame(PRKCA_CRISPR_PhosR_Signalome_Signalomes_df[i*2]))
+}
+for (i in ls(pattern="_Signalome_.*_x")) {
+     x=get(i)
+     colnames(x) <- c("Kinase", "Family", "Score")
+     assign(i,x)
+}
+PRKCA_CRISPR_PhosR_Signalome_combined <- na.omit(do.call("rbind", lapply(ls(pattern="_Signalome_.*_x"), get))[,c(1,3)])
+PRKCA_CRISPR_PhosR_Signalome_combined$Phosphosite <- rownames(PRKCA_CRISPR_PhosR_Signalome_combined)
+PRKCA_CRISPR_PhosR_Signalome_combined_pruned <- PRKCA_CRISPR_PhosR_Signalome_combined[duplicated(PRKCA_CRISPR_PhosR_Signalome_combined$Phosphosite) == FALSE & duplicated(PRKCA_CRISPR_PhosR_Signalome_combined$Phosphosite, fromLast=TRUE) == FALSE,]
+PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered <- PRKCA_CRISPR_PhosR_Signalome_combined_pruned[PRKCA_CRISPR_PhosR_Signalome_combined_pruned[,2] > 0.5,]
+table(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered[,1])
+
+PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered_significant <- PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered[rownames(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered) %in% rownames(PRKCA_CRISPR_PhosR_Analysis)[PRKCA_CRISPR_PhosR_Analysis$adj.P.Val < 0.05 & PRKCA_CRISPR_PhosR_Analysis$logFC < -1],]
+table(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered_significant[,1])
+
+PRKCA_CRISPR_PhosR_Signalome_combined_Modules <- cbind(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered_significant, plyr::mapvalues(x=gsub(";.*","",rownames(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered_significant)), from=names(PRKCA_CRISPR_PhosR_Signalome$proteinModules), to=PRKCA_CRISPR_PhosR_Signalome$proteinModules))
+colnames(PRKCA_CRISPR_PhosR_Signalome_combined_Modules) <- c("kinase","kinase_family","score","module")
+PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input <- PRKCA_CRISPR_PhosR_Signalome_combined_Modules[,c(1,4)]
+circos.clear()
+palette <- colorRampPalette(c("red","yellow"))
+circos.par(circle.margin=c(0.34,0.34,0.34,0.34))
+pdf(file="PRKCA_CRISPR_PhosR_downregulated_Signalome_10-4-24_adjusted_pvalue_05_colors.pdf", bg="white")
+par(cex=1.1, font=2)
+chordDiagram(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input, order=c(rev(names(table(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input[,2]))),names(table(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input[,1])[table(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input[,1]) > 0])), annotationTrack = "grid", grid.col=c(rep("lightgrey", length(table(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input[,2]))), c("red","pink","green","blue","purple")))
+circos.track(track.index = 1, panel.fun = function(x, y) {
+    circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index, 
+                facing = "clockwise", niceFacing = TRUE, adj = c(0, 0.5))
+}, bg.border = NA)
+dev.off()
+dev.off()
+
+
+#Visualize Signalome and Signalome map
+
+my_color_palette <- grDevices::colorRampPalette(RColorBrewer::brewer.pal(8, "Accent"))
+kinase_all_color <- my_color_palette(ncol(PRKCA_CRISPR_PhosR.matrices$combinedScoreMatrix))
+names(kinase_all_color) <- colnames(PRKCA_CRISPR_PhosR.matrices$combinedScoreMatrix)
+kinase_signalome_color <- kinase_all_color[colnames(PRKCA_CRISPR_PhosR.predMat)]
+plotSignalomeMap(signalomes = PRKCA_CRISPR_PhosR_Signalome, color = kinase_signalome_color)
+
+rm(list=ls(pattern="_Signalome_.*_x"))
+PRKCA_CRISPR_PhosR_Signalome_Signalomes_df <- unlist(PRKCA_CRISPR_PhosR_Signalome$Signalomes, recursive=FALSE)
+for (i in 1:length(names(PRKCA_CRISPR_PhosR_Signalome$Signalomes))) {
+assign(paste0("PRKCA_CRISPR_PhosR_Signalome_", names(PRKCA_CRISPR_PhosR_Signalome$Signalomes)[i], "_x"), as.data.frame(PRKCA_CRISPR_PhosR_Signalome_Signalomes_df[i*2]))
+}
+for (i in ls(pattern="_Signalome_.*_x")) {
+     x=get(i)
+     colnames(x) <- c("Kinase", "Family", "Score")
+     assign(i,x)
+}
+PRKCA_CRISPR_PhosR_Signalome_combined <- na.omit(do.call("rbind", lapply(ls(pattern="_Signalome_.*_x"), get))[,c(1,3)])
+PRKCA_CRISPR_PhosR_Signalome_combined$Phosphosite <- rownames(PRKCA_CRISPR_PhosR_Signalome_combined)
+PRKCA_CRISPR_PhosR_Signalome_combined_pruned <- PRKCA_CRISPR_PhosR_Signalome_combined[duplicated(PRKCA_CRISPR_PhosR_Signalome_combined$Phosphosite) == FALSE & duplicated(PRKCA_CRISPR_PhosR_Signalome_combined$Phosphosite, fromLast=TRUE) == FALSE,]
+PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered <- PRKCA_CRISPR_PhosR_Signalome_combined_pruned[PRKCA_CRISPR_PhosR_Signalome_combined_pruned[,2] > 0.5,]
+table(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered[,1])
+
+PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered_significant <- PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered[rownames(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered) %in% rownames(PRKCA_CRISPR_PhosR_Analysis)[PRKCA_CRISPR_PhosR_Analysis$adj.P.Val < 0.20 & PRKCA_CRISPR_PhosR_Analysis$logFC < -1],]
+table(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered_significant[,1])
+
+PRKCA_CRISPR_PhosR_Signalome_combined_Modules <- cbind(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered_significant, plyr::mapvalues(x=gsub(";.*","",rownames(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered_significant)), from=names(PRKCA_CRISPR_PhosR_Signalome$proteinModules), to=PRKCA_CRISPR_PhosR_Signalome$proteinModules))
+colnames(PRKCA_CRISPR_PhosR_Signalome_combined_Modules) <- c("kinase","kinase_family","score","module")
+PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input <- PRKCA_CRISPR_PhosR_Signalome_combined_Modules[,c(1,4)]
+circos.clear()
+palette <- colorRampPalette(c("red","yellow"))
+circos.par(circle.margin=c(0.34,0.34,0.34,0.34))
+pdf(file="PRKCA_CRISPR_PhosR_downregulated_Signalome_10-4-24_adjusted_pvalue_20_colors.pdf", bg="white")
+par(cex=1.1, font=2)
+chordDiagram(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input, order=c(rev(names(table(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input[,2]))),names(table(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input[,1])[table(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input[,1]) > 0])), annotationTrack = "grid", grid.col=c(rep("lightgrey", length(table(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input[,2]))), c("red","aquamarine","pink","green","blue","purple")))
+circos.track(track.index = 1, panel.fun = function(x, y) {
+    circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index, 
+                facing = "clockwise", niceFacing = TRUE, adj = c(0, 0.5))
+}, bg.border = NA)
+dev.off()
+dev.off()
+
+
+#Visualize Signalome and Signalome map
+
+my_color_palette <- grDevices::colorRampPalette(RColorBrewer::brewer.pal(8, "Accent"))
+kinase_all_color <- my_color_palette(ncol(PRKCA_CRISPR_PhosR.matrices$combinedScoreMatrix))
+names(kinase_all_color) <- colnames(PRKCA_CRISPR_PhosR.matrices$combinedScoreMatrix)
+kinase_signalome_color <- kinase_all_color[colnames(PRKCA_CRISPR_PhosR.predMat)]
+plotSignalomeMap(signalomes = PRKCA_CRISPR_PhosR_Signalome, color = kinase_signalome_color)
+
+rm(list=ls(pattern="_Signalome_.*_x"))
+PRKCA_CRISPR_PhosR_Signalome_Signalomes_df <- unlist(PRKCA_CRISPR_PhosR_Signalome$Signalomes, recursive=FALSE)
+for (i in 1:length(names(PRKCA_CRISPR_PhosR_Signalome$Signalomes))) {
+assign(paste0("PRKCA_CRISPR_PhosR_Signalome_", names(PRKCA_CRISPR_PhosR_Signalome$Signalomes)[i], "_x"), as.data.frame(PRKCA_CRISPR_PhosR_Signalome_Signalomes_df[i*2]))
+}
+for (i in ls(pattern="_Signalome_.*_x")) {
+     x=get(i)
+     colnames(x) <- c("Kinase", "Family", "Score")
+     assign(i,x)
+}
+PRKCA_CRISPR_PhosR_Signalome_combined <- na.omit(do.call("rbind", lapply(ls(pattern="_Signalome_.*_x"), get))[,c(1,3)])
+PRKCA_CRISPR_PhosR_Signalome_combined$Phosphosite <- rownames(PRKCA_CRISPR_PhosR_Signalome_combined)
+PRKCA_CRISPR_PhosR_Signalome_combined_pruned <- PRKCA_CRISPR_PhosR_Signalome_combined[duplicated(PRKCA_CRISPR_PhosR_Signalome_combined$Phosphosite) == FALSE & duplicated(PRKCA_CRISPR_PhosR_Signalome_combined$Phosphosite, fromLast=TRUE) == FALSE,]
+PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered <- PRKCA_CRISPR_PhosR_Signalome_combined_pruned[PRKCA_CRISPR_PhosR_Signalome_combined_pruned[,2] > 0.5,]
+table(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered[,1])
+
+PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered_significant <- PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered[rownames(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered) %in% rownames(PRKCA_CRISPR_PhosR_Analysis)[PRKCA_CRISPR_PhosR_Analysis$adj.P.Val < 0.25 & PRKCA_CRISPR_PhosR_Analysis$logFC < -1],]
+table(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered_significant[,1])
+
+PRKCA_CRISPR_PhosR_Signalome_combined_Modules <- cbind(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered_significant, plyr::mapvalues(x=gsub(";.*","",rownames(PRKCA_CRISPR_PhosR_Signalome_combined_pruned_filtered_significant)), from=names(PRKCA_CRISPR_PhosR_Signalome$proteinModules), to=PRKCA_CRISPR_PhosR_Signalome$proteinModules))
+colnames(PRKCA_CRISPR_PhosR_Signalome_combined_Modules) <- c("kinase","kinase_family","score","module")
+PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input <- PRKCA_CRISPR_PhosR_Signalome_combined_Modules[,c(1,4)]
+circos.clear()
+palette <- colorRampPalette(c("red","yellow"))
+circos.par(circle.margin=c(0.34,0.34,0.34,0.34))
+pdf(file="PRKCA_CRISPR_PhosR_downregulated_Signalome_10-4-24_adjusted_pvalue_25_colors.pdf", bg="white")
+par(cex=1.1, font=2)
+chordDiagram(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input, order=c(rev(names(table(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input[,2]))),names(table(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input[,1])[table(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input[,1]) > 0])), annotationTrack = "grid", grid.col=c(rep("lightgrey", length(table(PRKCA_CRISPR_PhosR_Signalome_combined_Modules_circlize_input[,2]))), c("red","aquamarine","steelblue","pink","green","blue","purple")))
+circos.track(track.index = 1, panel.fun = function(x, y) {
+    circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index, 
+                facing = "clockwise", niceFacing = TRUE, adj = c(0, 0.5))
+}, bg.border = NA)
+dev.off()
+dev.off()
+
+
